@@ -51,11 +51,34 @@ export function connectBrowserRuntime(
 	let connectionEpoch = 0;
 	const commandChains = new Map<string, Promise<void>>();
 	const commandControllers = new Map<string, AbortController>();
+	const activeCommands = new Map<
+		string,
+		{ command: BrowserRuntimeCommand; target: net.Socket; epoch: number }
+	>();
+
+	const sendCancelledResultOnTarget = (command: BrowserRuntimeCommand, target: net.Socket) => {
+		if (target.destroyed) return;
+		const frame = `${JSON.stringify({
+			type: "result",
+			requestId: command.requestId,
+			ok: false,
+			error: { code: "BROWSER_COMMAND_CANCELED", message: "Browser runtime link closed" },
+		})}\n`;
+		try {
+			target.write(frame);
+		} catch {
+			// Socket already torn down; the daemon will observe disconnect.
+		}
+	};
 
 	const cancelConnectionCommands = () => {
+		for (const { command, target } of activeCommands.values()) {
+			sendCancelledResultOnTarget(command, target);
+		}
 		for (const controller of commandControllers.values()) controller.abort();
 		commandControllers.clear();
 		commandChains.clear();
+		activeCommands.clear();
 	};
 
 	const clearRetry = () => {
@@ -67,10 +90,11 @@ export function connectBrowserRuntime(
 
 	const destroySocket = () => {
 		if (!socket) return;
-		connectionEpoch += 1;
+		const target = socket;
 		cancelConnectionCommands();
-		socket.removeAllListeners();
-		socket.destroy();
+		connectionEpoch += 1;
+		target.removeAllListeners();
+		target.destroy();
 		socket = null;
 	};
 
@@ -96,6 +120,27 @@ export function connectBrowserRuntime(
 		});
 	};
 
+	const sendCancelledResult = async (
+		command: BrowserRuntimeCommand,
+		target: net.Socket,
+		epoch: number,
+	) => {
+		try {
+			await send(
+				{
+					type: "result",
+					requestId: command.requestId,
+					ok: false,
+					error: { code: "BROWSER_COMMAND_CANCELED", message: "Browser runtime link closed" },
+				},
+				target,
+				epoch,
+			);
+		} catch {
+			// Socket already torn down; the daemon will observe disconnect.
+		}
+	};
+
 	const respond = async (
 		command: BrowserRuntimeCommand,
 		target: net.Socket,
@@ -108,7 +153,10 @@ export function connectBrowserRuntime(
 			controller.signal.throwIfAborted();
 			await send({ type: "result", requestId: command.requestId, ok: true, result }, target, epoch);
 		} catch (error) {
-			if (controller.signal.aborted) return;
+			if (controller.signal.aborted) {
+				await sendCancelledResult(command, target, epoch);
+				return;
+			}
 			const normalized = normalizeCommandError(error);
 			try {
 				await send({ type: "result", requestId: command.requestId, ok: false, error: normalized }, target, epoch);
@@ -117,6 +165,7 @@ export function connectBrowserRuntime(
 				target.destroy();
 			}
 		} finally {
+			activeCommands.delete(command.requestId);
 			if (commandControllers.get(command.requestId) === controller) {
 				commandControllers.delete(command.requestId);
 			}
@@ -146,6 +195,7 @@ export function connectBrowserRuntime(
 		}
 		const controller = new AbortController();
 		commandControllers.set(command.requestId, controller);
+		activeCommands.set(command.requestId, { command, target, epoch });
 		const previous = commandChains.get(command.sessionId) ?? Promise.resolve();
 		const next = previous.then(() => respond(command, target, epoch, controller));
 		commandChains.set(command.sessionId, next);
@@ -211,9 +261,9 @@ export function connectBrowserRuntime(
 		next.on("close", () => {
 			if (socket !== next || connectionEpoch !== epoch) return;
 			connected = false;
+			cancelConnectionCommands();
 			socket = null;
 			connectionEpoch += 1;
-			cancelConnectionCommands();
 			if (!disposed) scheduleReconnect();
 		});
 	}
