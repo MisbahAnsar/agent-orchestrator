@@ -75,10 +75,12 @@ export function connectBrowserRuntime(
 		for (const { command, target } of activeCommands.values()) {
 			sendCancelledResultOnTarget(command, target);
 		}
+		// Drop tracking before aborting so in-flight respond() catch paths do not
+		// emit a second cancellation frame for the same requestId.
+		activeCommands.clear();
 		for (const controller of commandControllers.values()) controller.abort();
 		commandControllers.clear();
 		commandChains.clear();
-		activeCommands.clear();
 	};
 
 	const clearRetry = () => {
@@ -154,7 +156,11 @@ export function connectBrowserRuntime(
 			await send({ type: "result", requestId: command.requestId, ok: true, result }, target, epoch);
 		} catch (error) {
 			if (controller.signal.aborted) {
-				await sendCancelledResult(command, target, epoch);
+				// Daemon-initiated cancel frames abort one controller without clearing
+				// activeCommands; connection teardown clears the map before aborting.
+				if (activeCommands.has(command.requestId)) {
+					await sendCancelledResult(command, target, epoch);
+				}
 				return;
 			}
 			const normalized = normalizeCommandError(error);
@@ -258,14 +264,19 @@ export function connectBrowserRuntime(
 		});
 		next.on("data", (chunk) => consume(chunk, next, epoch));
 		next.on("error", (error) => log(`browser-runtime-link: error: ${error.message}`));
-		next.on("close", () => {
-			if (socket !== next || connectionEpoch !== epoch) return;
+		let connectionTornDown = false;
+		const tearDownConnection = () => {
+			if (connectionTornDown || socket !== next || connectionEpoch !== epoch) return;
+			connectionTornDown = true;
 			connected = false;
 			cancelConnectionCommands();
 			socket = null;
 			connectionEpoch += 1;
 			if (!disposed) scheduleReconnect();
-		});
+		};
+		// Cancel while the socket may still accept writes; 'close' can arrive too late.
+		next.on("end", tearDownConnection);
+		next.on("close", tearDownConnection);
 	}
 
 	connect();
